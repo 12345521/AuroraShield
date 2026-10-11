@@ -25,6 +25,11 @@ KPM_LICENSE("gpl 2.0");
 KPM_AUTHOR("Lanzhou / Aurora");
 KPM_DESCRIPTION("极光防格机 - Aurora Anti-Brick Shield");
 
+/* 全局变量声明（必须放在最前面，不然报错） */
+static unsigned long g_sct;
+static unsigned long g_fp[20];
+static unsigned int _init_done = 0;
+
 /* ----------------------------------------------------------------------------
  *  基础工具
  * -------------------------------------------------------------------------- */
@@ -41,7 +46,6 @@ void *memset(void *dst, int c, unsigned long n) {
     return dst;
 }
 
-/* 简易前缀比较，替代 strncmp */
 static int bd_prefix(const char *p, const char *s)
 {
     while (*s) { if (*p++ != *s++) return 0; }
@@ -229,7 +233,7 @@ static int bd_exe_name(char *out, int out_sz){
 }
 
 /* ----------------------------------------------------------------------------
- *  系统进程识别（强化版：comm 命中后必须 exe 也匹配）
+ *  系统进程识别
  * -------------------------------------------------------------------------- */
 static int is_sys(void)
 {
@@ -242,7 +246,6 @@ static int is_sys(void)
     uid = bd_task_uid(t);
     uid_known = (uid != ~0u);
 
-    /* 先走 exe 路径匹配 */
     if (bd_exe_name(exe, sizeof(exe))) {
         for (i = 0; i < WLCNT; i++) {
             const wl_t *w = &wl_table[i];
@@ -254,7 +257,6 @@ static int is_sys(void)
     if (!kf_gtc) return 0;
     kf_gtc(comm, 16, t);
 
-    /* comm 命中后必须 exe 也匹配，否则视为伪装 */
     for (i = 0; i < WLCNT; i++) {
         const wl_t *w = &wl_table[i];
         j = 0;
@@ -316,7 +318,6 @@ typedef struct {
 #define BD_CREATE_FLAGS (0x40u | 0x400000u)
 
 static const prule_t openat_rules[] = {
-    /* ---- 原有规则 ---- */
     {{0x2f,0x64,0x65,0x76,0x2f,0x75,0x66,0x73,0x2d,0x62,0x73,0x67},12,0,0,0,0,"ufs-bsg"},
     {{0x2f,0x64,0x65,0x76,0x2f,0x62,0x73,0x67},8,0,0,0,0,"bsg"},
     {{0x2f,0x64,0x65,0x76,0x2f,0x73,0x67},7,0,0,0,0,"sg"},
@@ -330,8 +331,6 @@ static const prule_t openat_rules[] = {
     {{0x2f,0x64,0x61,0x74,0x61,0x2f,0x61,0x64,0x62,0x2f,0x6d,0x6f,0x64,0x75,0x6c,0x65,0x73,0x2f},18,0,1,1,1,"mod-modules"},
     {{0x2f,0x64,0x61,0x74,0x61,0x2f,0x61,0x64,0x62,0x2f,0x6d,0x6f,0x64,0x75,0x6c,0x65,0x73,0x5f,0x75,0x70,0x64,0x61,0x74,0x65,0x2f},25,0,1,1,1,"mod-modules"},
     {{0x2f,0x64,0x65,0x76,0x2f,0x62,0x6c,0x6f,0x63,0x6b},10,0,0,0,0,"block-open"},
-
-    /* ---- 新增规则 ---- */
     {{0x2f,0x64,0x65,0x76,0x2f,0x62,0x6c,0x6f,0x63,0x6b,0x2f,0x62,0x79,0x2d,0x6e,0x61,0x6d,0x65},18,0,0,0,0,"block-by-name"},
     {{0x2f,0x73,0x79,0x73,0x2f,0x70,0x6f,0x77,0x65,0x72,0x2f},11,0,0,0,0,"sys-power"},
     {{0x2f,0x73,0x79,0x73,0x2f,0x6b,0x65,0x72,0x6e,0x65,0x6c,0x2f},12,0,0,0,0,"sys-kernel"},
@@ -616,7 +615,6 @@ static void find_cb(hook_fargs2_t *f, void *u)
     bd_observe("find-module");
 }
 
-/* ---- 新增：reboot ---- */
 static void reboot_cb(hook_fargs1_t *f, void *u)
 {
     struct pt_regs { unsigned long r[31]; unsigned long sp, pc, ps; } *regs;
@@ -634,7 +632,6 @@ static void reboot_cb(hook_fargs1_t *f, void *u)
         bd_observe("reboot-fake-magic");
         return;
     }
-    /* 只放行标准重启/关机 cmd，其它一律拒绝 */
     if (cmd != 0x01234567 && cmd != 0xCDEF0123 && cmd != 0x4321FEDC) {
         f->skip_origin = 1;
         f->ret = (uint64_t)(-1);
@@ -643,7 +640,6 @@ static void reboot_cb(hook_fargs1_t *f, void *u)
     }
 }
 
-/* ---- 新增：execve ---- */
 static void execve_cb(hook_fargs3_t *f, void *u)
 {
     struct pt_regs { unsigned long r[31]; unsigned long sp, pc, ps; } *regs;
@@ -668,7 +664,6 @@ static void execve_cb(hook_fargs3_t *f, void *u)
     }
 }
 
-/* ---- 新增：mknodat ---- */
 static void mknod_cb(hook_fargs3_t *f, void *u)
 {
     struct pt_regs { unsigned long r[31]; unsigned long sp, pc, ps; } *regs;
@@ -750,19 +745,16 @@ static int aurora_selfcheck(void)
     logki("[aurora] |     Aurora Shield 自检 - Self Check       |\n");
     logki("[aurora] +------------------------------------------+\n");
 
-    /* 1. kallsyms */
     if (!kallsyms_lookup_name)
         aurora_check("kallsyms_lookup_name", 2, "符号查找不可用");
     else
         aurora_check("kallsyms_lookup_name", 0, 0);
 
-    /* 2. sys_call_table */
     if (!g_sct)
         aurora_check("sys_call_table", 2, "地址为空");
     else
         aurora_check("sys_call_table", 0, 0);
 
-    /* 3. 核心内核函数 */
     if (!g_kt_ptr) aurora_check("ktime_get", 1, "限流关闭");
     else aurora_check("ktime_get", 0, 0);
 
@@ -777,7 +769,6 @@ static int aurora_selfcheck(void)
     else
         aurora_check("exe_anchor", 0, 0);
 
-    /* 4. Hook 挂载情况 */
     armed = 0; total = 0;
     for (i = 0; i < BD_HOOK_NUM; i++) {
         if (i == 6 || i == 13 || i == 14) continue;
@@ -791,13 +782,11 @@ static int aurora_selfcheck(void)
     else
         aurora_check("hooks", 2, "Hook 挂载率过低");
 
-    /* 5. 白名单 */
     if (WLCNT < 10)
         aurora_check("whitelist", 1, "条目过少");
     else
         aurora_check("whitelist", 0, 0);
 
-    /* 6. 退化模式 */
     if (g_narrow)
         aurora_check("degrade_mode", 2, "关键能力缺失");
     else
@@ -885,36 +874,13 @@ static void aurora_effect_fail(void)
 #define NR_execve          221
 #define NR_mknodat         33
 
-static unsigned long g_sct;
-static unsigned long g_fp[BD_HOOK_NUM];
-static unsigned int _init_done = 0;
-
 static int hook_syscall(int idx, unsigned long addr, int argc, void *cb, void *after)
 {
     static const int nr_map[] = {
-        /* 0  */ -1,
-        /* 1  */ -1,
-        /* 2  */ -1,
-        /* 3  */ NR_openat,
-        /* 4  */ NR_init_module,
-        /* 5  */ NR_finit_module,
-        /* 6  */ -1,
-        /* 7  */ NR_kill,
-        /* 8  */ NR_tkill,
-        /* 9  */ NR_tgkill,
-        /* 10 */ -1,
-        /* 11 */ -1,
-        /* 12 */ NR_delete_module,
-        /* 13 */ -1,
-        /* 14 */ -1,
-        /* 15 */ -1,
-        /* 16 */ NR_openat2,
-        /* 17 */ -1,
-        /* 18 */ NR_symlinkat,
-        /* 19 */ NR_renameat2,
-        /* 20 */ NR_reboot,
-        /* 21 */ NR_execve,
-        /* 22 */ NR_mknodat,
+        -1, -1, -1, NR_openat, NR_init_module, NR_finit_module,
+        -1, NR_kill, NR_tkill, NR_tgkill, -1, -1, NR_delete_module,
+        -1, -1, -1, NR_openat2, -1, NR_symlinkat, NR_renameat2,
+        NR_reboot, NR_execve, NR_mknodat,
     };
     if (idx >= 0 && idx < BD_HOOK_NUM && nr_map[idx] >= 0 && g_sct) {
         g_fp[idx] = g_sct + nr_map[idx] * 8;
@@ -1026,7 +992,6 @@ static long init_fn(const char *a, const char *e, void *__user r)
     if (g_narrow)
         logke("[aurora] DEGRADE: identity/path anchor missing\n");
 
-    /* 解析符号地址 */
     g_hk[0] = kln_cfi("blkdev_open");
     if (g_hk[0]) g_hk_argc[0] = 2;
     else {
@@ -1057,7 +1022,6 @@ static long init_fn(const char *a, const char *e, void *__user r)
     g_hk[18] = kln_cfi("__arm64_sys_symlinkat"); if (g_hk[18]) g_hk_argc[18] = 1;
     g_hk[19] = kln_cfi("__arm64_sys_renameat2"); if (g_hk[19]) g_hk_argc[19] = 1;
 
-    /* 新增 */
     g_hk[20] = kln_cfi("__arm64_sys_reboot");  if (g_hk[20]) g_hk_argc[20] = 1;
     g_hk[21] = kln_cfi("__arm64_sys_execve");  if (g_hk[21]) g_hk_argc[21] = 3;
     g_hk[22] = kln_cfi("__arm64_sys_mknodat"); if (g_hk[22]) g_hk_argc[22] = 4;
@@ -1120,7 +1084,6 @@ static long ctl_fn(const char *a, char *__user o, int n)
         return 0;
     }
 
-    /* S: 状态查询  "on/off,blocked[,D]\n" */
     if (a[0] == 'S' && (a[1] == 0 || a[1] == 10)) {
         char b[64]; int l = 0;
         b[l++] = g_on ? '1' : '0';
@@ -1134,7 +1097,6 @@ static long ctl_fn(const char *a, char *__user o, int n)
         return 0;
     }
 
-    /* M: 模块保护 */
     if (a[0] == 'M' && a[1] == ':') {
         if (a[2] == '1') {
             g_module_protect = 1;
@@ -1162,7 +1124,6 @@ static long ctl_fn(const char *a, char *__user o, int n)
         }
     }
 
-    /* A: ADB 告警 */
     if (a[0] == 'A' && a[1] == ':') {
         if (a[2] == 'Q') {
             char b[80]; int l = 0;
@@ -1184,13 +1145,11 @@ static long ctl_fn(const char *a, char *__user o, int n)
         }
     }
 
-    /* V: 版本 */
     if (a[0] == 'V' && a[1] == ':' && a[2] == 'Q') {
         if (o && n > 12) compat_copy_to_user(o, "aurora2026.1\n", 13);
         return 0;
     }
 
-    /* F: 故障列表 */
     if (a[0] == 'F' && a[1] == ':' && a[2] == 'Q') {
         char b[768]; int l = 0; int v;
         for (v = 0; v < BD_HOOK_NUM; v++) {
@@ -1209,14 +1168,12 @@ static long ctl_fn(const char *a, char *__user o, int n)
         return 0;
     }
 
-    /* C: 强制自检 */
     if (a[0] == 'C' && a[1] == ':' && a[2] == 'Q') {
         int r = aurora_selfcheck();
         if (o && n > 4) compat_copy_to_user(o, r ? "ok\n" : "bad\n", r ? 3 : 4);
         return 0;
     }
 
-    /* V T / V U / V D */
     if (a[0] == 'V' && (a[1] == 'T' || a[1] == 'U' || a[1] == 'D') && a[2] == ':') {
         if (a[1] == 'U') {
             g_unlock_at = bd_now();
@@ -1233,7 +1190,6 @@ static long ctl_fn(const char *a, char *__user o, int n)
             return 0;
         }
 
-        /* VT: 激活流程：自检 -> 特效 -> 开启 */
         logki("[aurora] activation requested, running self-check...\n");
 
         if (g_unlock_at) g_unlock_at = 0;
@@ -1248,7 +1204,6 @@ static long ctl_fn(const char *a, char *__user o, int n)
             } else {
                 aurora_effect_fail();
                 if (g_check_fail == 0) {
-                    /* 有 warn 无 fail：仍然允许开启，但警告 */
                     aurora_effect_warn(g_check_warn, g_check_fail);
                     g_on_at = bd_now();
                     bd_store_release(&g_on, 1);
